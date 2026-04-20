@@ -1,0 +1,15 @@
+#Deep Learning
+torch>=2.0.0
+torchvision
+numpy>=1.23.0
+
+#Visualization
+open3d>=0.16.0
+opencv-python-headless  
+scipy                   
+filterpy              
+
+#Dataset
+nuscenes-devkit         
+pyyaml                  
+tqdm                    
