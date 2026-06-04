@@ -1,15 +1,15 @@
-#Deep Learning
+# --- Deep Learning & AI ---
 torch>=2.0.0
 torchvision
 numpy>=1.23.0
+ultralytics             
 
-#Visualization
-open3d>=0.16.0
-opencv-python-headless  
+# --- Point Cloud & 3D Math ---
+open3d>=0.16.0          
 scipy                   
-filterpy              
+filterpy                
 
-#Dataset
-nuscenes-devkit         
+# --- Computer Vision & Utils ---
+opencv-python-headless  
 pyyaml                  
-tqdm                    
+tqdm                   
