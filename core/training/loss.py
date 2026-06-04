@@ -1,131 +1,200 @@
-import sys
-import os
-import time
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from pathlib import Path
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Optional
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.append(str(BASE_DIR))
 
-from models.pointpillars import PointPillars, PointPillarsConfig
-from training.loss import PointPillarsLoss
-from utils.preprocess import DAIRDataset
+class PointPillarsLoss(nn.Module):
+    CLASS_RADIUS = {0: 2.0, 1: 0.6, 2: 1.0}   
 
-def collate_fn(batch):
-    return {
-        'pillars': torch.stack([b['pillars'] for b in batch], dim=0).float(),
-        'coords': torch.stack([b['coords'] for b in batch], dim=0).int(),
-        'num_points': torch.stack([b['num_points'] for b in batch], dim=0).int(),
-        'gt_boxes': [b['gt_boxes'].float() for b in batch],
-        'frame_id': [b['frame_id'] for b in batch],
-    }
+    FOCAL_ALPHA: float = 0.25
+    FOCAL_GAMMA: float = 2.0
 
-def train():
-    cfg = PointPillarsConfig()
-    
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        use_amp = True
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        use_amp = False
-    else:
-        device = torch.device("cpu")
-        use_amp = False
+    CLS_WEIGHT: float = 1.0
+    REG_WEIGHT: float = 2.0
+    DIR_WEIGHT: float = 0.2
 
-    print(f"\n" + "="*40)
-    print(f"START OF TRAINING")
-    print(f"Device: {device} | AMP: {use_amp}")
-    print(f"Batch Size: {cfg.batch_size} | Epochs: {cfg.num_epochs}")
-    print("="*40 + "\n")
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
 
-    n_workers = 8 if device.type != 'cpu' else 0
-    if os.environ.get('COLAB_GPU'): n_workers = 4
+        self._anchor_cache: Optional[torch.Tensor] = None
+        self._anchor_cache_hw: Optional[tuple] = None
 
-    train_ds = DAIRDataset(split='train')
-    val_ds   = DAIRDataset(split='val')
+    def _get_anchor_xy(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        if self._anchor_cache_hw == (H, W) and self._anchor_cache is not None:
+            return self._anchor_cache.to(device)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, 
-        num_workers=n_workers, collate_fn=collate_fn,
-        pin_memory=(device.type == 'cuda'),
-        persistent_workers=(n_workers > 0)
-    )
-    
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False, 
-        num_workers=n_workers, collate_fn=collate_fn
-    )
+        x_min, x_max = self.cfg.x_range
+        y_min, y_max = self.cfg.y_range
 
-    model = PointPillars(cfg).to(device)
-    criterion = PointPillarsLoss().to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
-    
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=cfg.learning_rate, 
-        steps_per_epoch=len(train_loader), epochs=cfg.num_epochs
-    )
+        dx = (x_max - x_min) / W    
+        dy = (y_max - y_min) / H    
 
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        xs = torch.arange(W, dtype=torch.float32) * dx + x_min + dx * 0.5  
+        ys = torch.arange(H, dtype=torch.float32) * dy + y_min + dy * 0.5  
 
-    save_dir = BASE_DIR / 'checkpoints_universal'
-    save_dir.mkdir(exist_ok=True)
+        yy, xx = torch.meshgrid(ys, xs, indexing='ij')   
+        xy = torch.stack([xx, yy], dim=-1).reshape(H * W, 2)  
 
-    best_val_loss = float('inf')
+        anchor_xy = xy.repeat_interleave(2, dim=0)        
 
-    for epoch in range(cfg.num_epochs):
-        model.train()
-        epoch_losses = []
-        start_t = time.time()
+        self._anchor_cache    = anchor_xy
+        self._anchor_cache_hw = (H, W)
+        return anchor_xy.to(device)
 
-        for i, batch in enumerate(train_loader):
-            pillars = batch['pillars'].to(device, non_blocking=True)
-            coords = batch['coords'].to(device, non_blocking=True)
-            num_points = batch['num_points'].to(device, non_blocking=True)
-            gt_boxes = [b.to(device) for b in batch['gt_boxes']]
+    def _assign_targets(
+        self,
+        anchor_xy: torch.Tensor,
+        gt_boxes:  torch.Tensor,
+    ):
+        N      = anchor_xy.shape[0]
+        device = anchor_xy.device
 
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=use_amp):
-                preds = model(pillars, coords, num_points, batch_size=pillars.shape[0])
-                losses = criterion(preds, gt_boxes, batch_size=pillars.shape[0])
+        cls_targets = torch.zeros(N, 3, device=device)
+        reg_targets = torch.zeros(N, 7, device=device)
+        pos_mask    = torch.zeros(N, dtype=torch.bool, device=device)
 
-            scaler.scale(losses['total']).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+        M = gt_boxes.shape[0] if gt_boxes is not None else 0
+        if M == 0:
+            return cls_targets, reg_targets, pos_mask, ~pos_mask
 
-            epoch_losses.append(losses['total'].item())
+        gt_boxes = gt_boxes.to(device).float()
 
-            if i % 20 == 0:
-                print(f"E{epoch+1} [{i}/{len(train_loader)}] Loss: {losses['total'].item():.4f} | "
-                      f"Cls: {losses['cls'].item():.4f} | Reg: {losses['reg'].item():.4f}")
+        dists = torch.cdist(anchor_xy.float(), gt_boxes[:, :2])   
 
-        avg_train_loss = sum(epoch_losses) / len(epoch_losses)
-        
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_loader:
-                pillars, coords, n_pts = batch['pillars'].to(device), batch['coords'].to(device), batch['num_points'].to(device)
-                gt_boxes = [b.to(device) for b in batch['gt_boxes']]
-                preds = model(pillars, coords, n_pts, batch_size=pillars.shape[0])
-                v_losses = criterion(preds, gt_boxes, batch_size=pillars.shape[0])
-                val_losses.append(v_losses['total'].item())
+        cls_ids = gt_boxes[:, 7].long().clamp(0, 2).tolist()
+        radii   = torch.tensor(
+            [self.CLASS_RADIUS[c] for c in cls_ids],
+            dtype=torch.float32, device=device
+        )
 
-        avg_val_loss = sum(val_losses) / len(val_losses)
-        print(f"\nEpoch {epoch+1} | Time: {time.time()-start_t:.1f}s | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        norm_dists        = dists / radii.unsqueeze(0)  
+        min_norm, best_gt = norm_dists.min(dim=1)        
 
-        checkpoint = {'epoch': epoch+1, 'state_dict': model.state_dict(), 'val_loss': avg_val_loss}
-        torch.save(checkpoint, save_dir / 'last.pth')
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(checkpoint, save_dir / 'best.pth')
-            print(f"BEST MODEL (Loss: {avg_val_loss:.4f})")
+        pos_mask = min_norm < 1.0
 
-if __name__ == '__main__':
-    train()
+        best_gt_data = gt_boxes[best_gt]                              
+        gt_cls_int   = best_gt_data[:, 7].long().clamp(0, 2)         
+
+        cls_targets = (
+            F.one_hot(gt_cls_int, num_classes=3).float()
+            * pos_mask.float().unsqueeze(1)
+        )
+
+        reg_targets = best_gt_data[:, :7]
+
+        return cls_targets, reg_targets, pos_mask, ~pos_mask
+
+    def _focal_loss(
+        self,
+        logits:  torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        alpha = self.FOCAL_ALPHA
+        gamma = self.FOCAL_GAMMA
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )  
+
+        p  = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, p, 1.0 - p)
+
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(targets, alpha),
+            torch.full_like(targets, 1.0 - alpha),
+        )
+
+        loss = (alpha_t * (1.0 - pt).pow(gamma) * bce).mean()
+        return loss
+
+    def forward(
+        self,
+        preds:          dict,
+        gt_boxes_list:  List[torch.Tensor],
+        batch_size:     int,
+    ) -> dict:
+        cls_preds = preds['cls_preds']   
+        reg_preds = preds['reg_preds']   
+        dir_preds = preds['dir_preds']   
+
+        B      = batch_size
+        H, W   = cls_preds.shape[2], cls_preds.shape[3]
+        device = cls_preds.device
+
+        num_anchors = 2  
+        num_classes = 3
+        N = H * W * num_anchors
+
+        cls_p = (
+            cls_preds.permute(0, 2, 3, 1)      
+                     .reshape(B, H * W, num_anchors, num_classes)
+                     .reshape(B, N, num_classes)
+        )
+        reg_p = (
+            reg_preds.permute(0, 2, 3, 1)      
+                     .reshape(B, H * W, num_anchors, 7)
+                     .reshape(B, N, 7)
+        )
+        dir_p = (
+            dir_preds.permute(0, 2, 3, 1)      
+                     .reshape(B, H * W, num_anchors, 2)
+                     .reshape(B, N, 2)
+        )
+
+        anchor_xy = self._get_anchor_xy(H, W, device)  
+
+        cls_losses, reg_losses, dir_losses = [], [], []
+        num_pos_total = 0
+
+        for b in range(B):
+            gt = gt_boxes_list[b]
+
+            if isinstance(gt, torch.Tensor) and gt.numel() > 0:
+                valid = gt.abs().sum(dim=1) > 1e-5
+                gt    = gt[valid]
+
+            cls_t, reg_t, pos_mask, neg_mask = self._assign_targets(anchor_xy, gt)
+
+            num_pos_total += int(pos_mask.sum().item())
+
+            cls_loss_b = self._focal_loss(cls_p[b], cls_t)
+
+            if pos_mask.any():
+                reg_loss_b = F.smooth_l1_loss(
+                    reg_p[b][pos_mask],
+                    reg_t[pos_mask].to(device),
+                    beta=1.0,
+                    reduction='mean',
+                )
+
+                dir_target = (reg_t[pos_mask, 6] < 0).long().to(device)
+                dir_loss_b = F.cross_entropy(dir_p[b][pos_mask], dir_target)
+            else:
+                reg_loss_b = cls_preds.new_zeros(1).squeeze()
+                dir_loss_b = cls_preds.new_zeros(1).squeeze()
+
+            cls_losses.append(cls_loss_b)
+            reg_losses.append(reg_loss_b)
+            dir_losses.append(dir_loss_b)
+
+        cls_loss = sum(cls_losses) / B
+        reg_loss = sum(reg_losses) / B
+        dir_loss = sum(dir_losses) / B
+
+        total = (
+            self.CLS_WEIGHT * cls_loss
+            + self.REG_WEIGHT * reg_loss
+            + self.DIR_WEIGHT * dir_loss
+        )
+
+        return {
+            'total':   total,
+            'cls':     cls_loss,
+            'reg':     reg_loss,
+            'dir':     dir_loss,
+            'num_pos': num_pos_total // B,  
+        }
